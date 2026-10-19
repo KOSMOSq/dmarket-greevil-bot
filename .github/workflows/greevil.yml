@@ -1,0 +1,50 @@
+name: DMarket Greevil watcher
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: greevil-run
+  cancel-in-progress: false
+
+jobs:
+  check-offers:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check DMarket
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
+
+      - name: Persist checked offers
+        run: |
+          git config user.name "greevil-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add seen.json
+          git diff --staged --quiet && exit 0
+          git commit -m "Update checked offers"
+          for i in 1 2 3 4 5; do
+            git push && exit 0
+            git fetch origin main
+            git rebase origin/main -X ours
+            sleep 2
+          done
+          echo "::error::Failed to push seen.json after 5 retries"
+          exit 1
