@@ -105,12 +105,13 @@ def get_steam_effect(view_at_steam: str) -> str | None:
     return None
 
 
-def send_telegram_message(text: str) -> None:
+def send_telegram_message(text: str) -> bool:
     response = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                              data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
                              timeout=30)
     if not response.ok:
         logging.error(f"Telegram error: {response.text}")
+    return response.ok
 
 
 def build_message(offer: dict, effect: str, view_at_steam: str) -> str:
@@ -147,10 +148,11 @@ def main() -> None:
         if effect is None:
             continue  # couldn't read Steam this time — retry on the next run
 
-        seen[offer_id] = effect
         logging.info(f"{offer['title']} — effect: {effect or 'none'}")
         if effect.lower().split()[-1:] == [EFFECT_SUFFIX]:
-            send_telegram_message(build_message(offer, effect, view_at_steam))
+            if not send_telegram_message(build_message(offer, effect, view_at_steam)):
+                continue  # not delivered — try again on the next run
+        seen[offer_id] = effect
 
     # Forget offers that are no longer listed, so the file doesn't grow forever.
     listed = {o["offerId"] for o in offers}
