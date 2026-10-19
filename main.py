@@ -14,7 +14,7 @@ import re
 import time
 from pathlib import Path
 
-import requests
+from curl_cffi import requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,12 +32,9 @@ OFFER_URL = "https://api.dmarket.com/exchange/v1/offers/v2/{offer_id}"
 STEAM_INVENTORY_URL = "https://steamcommunity.com/inventory/{steam_id}/570/2"
 VIEW_AT_STEAM_RE = re.compile(r"profiles/(\d+)/inventory/#570_2_(\d+)")
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                         "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"}
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-session = requests.Session()
-session.headers.update(HEADERS)
+# Steam answers 429 to plain Python HTTP clients, so mimic a real Chrome.
+session = requests.Session(impersonate="chrome")
 
 
 def fetch_offers() -> list[dict]:
@@ -68,7 +65,6 @@ def get_view_at_steam(offer_id: str) -> str | None:
 
 
 _inventories: dict[str, dict] = {}
-_steam_blocked = False
 
 
 def get_steam_effect(view_at_steam: str) -> str | None:
@@ -83,20 +79,11 @@ def get_steam_effect(view_at_steam: str) -> str | None:
     steam_id, asset_id = match.groups()
 
     if steam_id not in _inventories:
-        global _steam_blocked
-        if _steam_blocked:
-            return None
-        for attempt in range(2):
-            time.sleep(5)  # be gentle with Steam's rate limit
-            response = session.get(STEAM_INVENTORY_URL.format(steam_id=steam_id),
-                                   params={"l": "english", "count": 2000}, timeout=30)
-            if response.status_code != 429:
-                break
-            logging.warning("Steam rate limit (429), waiting 60s")
-            time.sleep(60)
-        if response.status_code == 429:
-            _steam_blocked = True  # stop hitting Steam this run; the rest is retried next run
+        time.sleep(5)  # be gentle with Steam's rate limit
+        response = session.get(STEAM_INVENTORY_URL.format(steam_id=steam_id),
+                               params={"l": "english", "count": 2000}, timeout=30)
         if response.status_code != 200:
+            # 429 = Steam rate limit, 403 = private inventory; retried next run
             logging.warning(f"Steam inventory {steam_id}: HTTP {response.status_code}")
             return None
         _inventories[steam_id] = response.json() or {}
@@ -154,7 +141,7 @@ def main() -> None:
         try:
             view_at_steam = get_view_at_steam(offer_id)
             effect = get_steam_effect(view_at_steam)
-        except requests.RequestException as error:
+        except requests.RequestsError as error:
             logging.warning(f"{offer_id}: {error}")
             continue
         if effect is None:
