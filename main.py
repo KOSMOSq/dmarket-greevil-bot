@@ -1,10 +1,12 @@
 """
-Watches DMarket for Unusual Greevil couriers whose Steam "Effect" is any
-"... Aura" and sends each new match to Telegram.
+Watches DMarket for Dota 2 items with a specific Steam attribute and sends
+each new match to Telegram:
+  - Unusual Greevil couriers whose "Effect" is any "... Aura";
+  - Bow of the Lone Traveler (any quality) with any Ethereal Gem socketed.
 
-DMarket's listing API doesn't expose the effect, so for every new offer we
-follow its "View at Steam" link and read the Effect line from the seller's
-public Steam inventory. No DMarket account or API keys are needed.
+DMarket's listing API doesn't expose effects or gems, so for every new offer
+we follow its "View at Steam" link and read the item's description from the
+seller's public Steam inventory. No DMarket account or API keys are needed.
 """
 import html
 import json
@@ -22,8 +24,6 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SEARCH_TITLE = "Unusual Greevil"
-EFFECT_SUFFIX = "aura"  # Effect must end with this word, e.g. "Ethereal Flame Aura"
 DOTA2_GAME_ID = "9a92"
 SEEN_FILE = Path(__file__).with_name("seen.json")
 
@@ -31,18 +31,20 @@ MARKET_URL = "https://api.dmarket.com/exchange/v1/market/items/v2"
 OFFER_URL = "https://api.dmarket.com/exchange/v1/offers/v2/{offer_id}"
 STEAM_INVENTORY_URL = "https://steamcommunity.com/inventory/{steam_id}/570/2"
 VIEW_AT_STEAM_RE = re.compile(r"profiles/(\d+)/inventory/#570_2_(\d+)")
+# A socketed gem in Steam's description HTML: <span>Gem name</span><br><span>Gem type</span>
+ETHEREAL_GEM_RE = re.compile(r">([^<>]+)</span><br><span[^>]*>Ethereal Gem</span>")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 # Steam answers 429 to plain Python HTTP clients, so mimic a real Chrome.
 session = requests.Session(impersonate="chrome")
 
 
-def fetch_offers() -> list[dict]:
-    """Returns every DMarket offer matching SEARCH_TITLE (all pages)."""
+def fetch_offers(search_title: str) -> list[dict]:
+    """Returns every DMarket offer matching search_title (all pages)."""
     offers, page_token = [], ""
     while True:
         response = session.get(MARKET_URL, params={
-            "title": SEARCH_TITLE, "gameId": DOTA2_GAME_ID, "side": "market",
+            "title": search_title, "gameId": DOTA2_GAME_ID, "side": "market",
             "orderBy": "updated", "orderDir": "desc", "treeFilters": "",
             "pageSize": 100, "currency": "USD", "platform": "browser",
             "pageToken": page_token,
@@ -67,11 +69,11 @@ def get_view_at_steam(offer_id: str) -> str | None:
 _inventories: dict[str, dict] = {}
 
 
-def get_steam_effect(view_at_steam: str) -> str | None:
+def get_steam_description(view_at_steam: str) -> list[str] | None:
     """
-    Reads the "Effect: ..." line of the item behind a "View at Steam" link.
-    Returns "" when the item has no effect, None when Steam can't be read
-    (private inventory, rate limit, item gone) so the offer is retried later.
+    Returns the description lines of the item behind a "View at Steam" link,
+    or None when Steam can't be read (private inventory, rate limit, item gone)
+    so the offer is retried on the next run.
     """
     match = VIEW_AT_STEAM_RE.search(view_at_steam or "")
     if not match:
@@ -94,15 +96,43 @@ def get_steam_effect(view_at_steam: str) -> str | None:
         return None
     for description in inventory.get("descriptions", []):
         if (description["classid"], description["instanceid"]) == (asset["classid"], asset["instanceid"]):
-            for line in description.get("descriptions", []):
-                # Only Steam's own "Effect:" attribute counts. Sellers' custom
-                # descriptions (e.g. "''Aura de Sanct''") are shown in quotes
-                # and never start with "Effect:", so they're ignored.
-                value = line.get("value", "").strip()
-                if value.startswith("Effect:"):
-                    return value.removeprefix("Effect:").strip()
-            return ""
+            return [line.get("value", "").strip() for line in description.get("descriptions", [])]
     return None
+
+
+# Each matcher reads an item's Steam description lines and returns what to
+# report ("" when the item doesn't qualify). Sellers' custom descriptions
+# can't fake either: Steam shows them in quotes (e.g. "''Aura de Sanct''")
+# and escapes any HTML in them.
+
+def greevil_aura_effect(lines: list[str]) -> str:
+    """The "Effect: ..." attribute, only when it is some "... Aura"."""
+    for value in lines:
+        if value.startswith("Effect:"):
+            effect = value.removeprefix("Effect:").strip()
+            return effect if effect.lower().split()[-1:] == ["aura"] else ""
+    return ""
+
+
+def ethereal_gems(lines: list[str]) -> str:
+    """Names of every Ethereal Gem socketed in the item."""
+    return ", ".join(html.unescape(name).strip()
+                     for value in lines for name in ETHEREAL_GEM_RE.findall(value))
+
+
+WATCHES = [
+    {
+        "name": "Unusual Greevil", "search": "Unusual Greevil",
+        "emoji": "🐲", "label": "Effect", "match": greevil_aura_effect,
+        "accept": lambda o: "greevil" in o["title"].lower()
+                            and (o.get("dota2") or {}).get("quality") == "unusual",
+    },
+    {
+        "name": "Bow of the Lone Traveler", "search": "Bow of the Lone Traveler",
+        "emoji": "🏹", "label": "Ethereal Gem", "match": ethereal_gems,
+        "accept": lambda o: "bow of the lone traveler" in o["title"].lower(),
+    },
+]
 
 
 def send_telegram_message(text: str) -> bool:
@@ -114,13 +144,13 @@ def send_telegram_message(text: str) -> bool:
     return response.ok
 
 
-def build_message(offer: dict, effect: str, view_at_steam: str) -> str:
+def build_message(watch: dict, offer: dict, found: str, view_at_steam: str) -> str:
     price = offer.get("priceCents", 0) / 100
     url = f"https://dmarket.com/ingame-items/item-list/dota2-skins?userOfferId={offer['offerId']}"
     return (
-        f"🐲 DMarket\n\n"
+        f"{watch['emoji']} DMarket\n\n"
         f"🔍 <b>{html.escape(offer['title'])}</b>\n\n"
-        f"✨ Effect: <b>{html.escape(effect)}</b>\n"
+        f"✨ {watch['label']}: <b>{html.escape(found)}</b>\n"
         f"💰 ${price:.2f}\n\n"
         f"🔗 {url}\n"
         f"🎮 {view_at_steam}"
@@ -129,34 +159,44 @@ def build_message(offer: dict, effect: str, view_at_steam: str) -> str:
 
 def main() -> None:
     seen: dict[str, str] = json.loads(SEEN_FILE.read_text()) if SEEN_FILE.exists() else {}
+    listed: set[str] = set()
+    all_fetched = True
 
-    offers = [o for o in fetch_offers()
-              if "greevil" in o.get("title", "").lower()
-              and (o.get("dota2") or {}).get("quality") == "unusual"]
-    logging.info(f"{len(offers)} Unusual Greevil offers on DMarket, {len(seen)} already checked")
-
-    for offer in offers:
-        offer_id = offer["offerId"]
-        if offer_id in seen:
-            continue
+    for watch in WATCHES:
         try:
-            view_at_steam = get_view_at_steam(offer_id)
-            effect = get_steam_effect(view_at_steam)
+            offers = [o for o in fetch_offers(watch["search"]) if watch["accept"](o)]
         except requests.RequestsError as error:
-            logging.warning(f"{offer_id}: {error}")
+            logging.warning(f"{watch['name']}: DMarket search failed: {error}")
+            all_fetched = False
             continue
-        if effect is None:
-            continue  # couldn't read Steam this time — retry on the next run
+        listed |= {o["offerId"] for o in offers}
+        logging.info(f"{watch['name']}: {len(offers)} offers on DMarket, "
+                     f"{sum(o['offerId'] in seen for o in offers)} already checked")
 
-        logging.info(f"{offer['title']} — effect: {effect or 'none'}")
-        if effect.lower().split()[-1:] == [EFFECT_SUFFIX]:
-            if not send_telegram_message(build_message(offer, effect, view_at_steam)):
+        for offer in offers:
+            offer_id = offer["offerId"]
+            if offer_id in seen:
+                continue
+            try:
+                view_at_steam = get_view_at_steam(offer_id)
+                lines = get_steam_description(view_at_steam)
+            except requests.RequestsError as error:
+                logging.warning(f"{offer_id}: {error}")
+                continue
+            if lines is None:
+                continue  # couldn't read Steam this time — retry on the next run
+
+            found = watch["match"](lines)
+            logging.info(f"{offer['title']} ${offer.get('priceCents', 0) / 100:.2f} — "
+                         f"{watch['label']}: {found or 'no match'}")
+            if found and not send_telegram_message(build_message(watch, offer, found, view_at_steam)):
                 continue  # not delivered — try again on the next run
-        seen[offer_id] = effect
+            seen[offer_id] = found
 
-    # Forget offers that are no longer listed, so the file doesn't grow forever.
-    listed = {o["offerId"] for o in offers}
-    seen = {k: v for k, v in seen.items() if k in listed}
+    # Forget offers that are no longer listed, so the file doesn't grow forever
+    # (skipped when a search failed, or its offers would be re-sent next run).
+    if all_fetched:
+        seen = {k: v for k, v in seen.items() if k in listed}
     SEEN_FILE.write_text(json.dumps(seen, indent=1, sort_keys=True))
 
 

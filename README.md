@@ -1,10 +1,13 @@
-# DMarket Greevil watcher
+# DMarket item watcher
 
-Every 10 minutes (GitHub Actions) checks DMarket for **Unusual Greevil** couriers and sends a Telegram message for each one whose Steam **Effect** is any "… Aura" (other effects like "Vas Air" are skipped).
+Every few minutes (GitHub Actions, triggered by an external cron) checks DMarket and sends a Telegram message for each new offer of:
 
-DMarket doesn't show the effect, so for each new offer the bot follows its "View at Steam" link and reads the `Effect:` line from the seller's public Steam inventory. No DMarket account or API keys needed.
+- **Unusual Greevil** whose Steam **Effect** is any "… Aura" (other effects like "Vas Air" are skipped);
+- **Bow of the Lone Traveler** (any quality) with any **Ethereal Gem** socketed.
 
-- Search / keyword: `SEARCH_TITLE` and `EFFECT_SUFFIX` in `main.py`.
+DMarket doesn't show effects or gems, so for each new offer the bot follows its "View at Steam" link and reads the item description from the seller's public Steam inventory. Sellers' custom descriptions can't fake a match: Steam shows them in quotes and escapes HTML. No DMarket account or API keys needed.
+
+- Searches live in `WATCHES` in `main.py`; each has a DMarket search title, a title/quality filter and a matcher over the Steam description.
 - `seen.json` stores offers already checked (committed back by the workflow), so each offer is reported once. Offers whose Steam inventory couldn't be read are retried next run.
 
 ## Setup
